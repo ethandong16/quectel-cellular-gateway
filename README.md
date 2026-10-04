@@ -1,56 +1,58 @@
-# 把 ARMv7 电视盒子变成短信通知网关：Asterisk、Quectel 与 Bark 部署教程
+# Turn an ARMv7 TV box into an SMS notification gateway: Asterisk, Quectel, and Bark
 
-把闲置电视盒子刷成 Linux，接上移远 Quectel 模块，就可以用 Asterisk 接收短信，再通过 Bark 推送到手机。
+English is the primary guide. For the Chinese version, see [README.zh-CN.md](README.zh-CN.md).
 
-示例采用华为悦盒 EC6108V9C / Hi3798MV100 类 ARMv7 设备、Quectel EC20F/EC25 系列模块和 `2c7c:0125` USB ID。实际板型、无线芯片、模块固件和端口编号可能不同，部署前应以设备探测结果为准。
+Flash the spare TV box with Linux, attach a Quectel module, receive SMS with Asterisk, and forward notifications to a phone through Bark.
 
-## 1. 准备硬件，理解各部分的职责
+The example uses a Huawei Yuebox EC6108V9C / Hi3798MV100-class ARMv7 device, a Quectel EC20F/EC25-series module, and USB ID `2c7c:0125`. Board model, wireless chipset, module firmware, and port numbering may differ; probe the actual device before deployment.
 
-| 项目     | 本文使用的环境或约定                              |
+## 1. Prepare the hardware and understand each component
+
+| Item | Environment or convention used in this guide |
 | ------ | --------------------------------------- |
-| 电视盒子   | 华为悦盒 EC6108V9C，实际 SoC、板型以设备为准           |
-| 系统     | HiNAS 32-bit，Ubuntu 20.04.6 LTS         |
-| 内核与架构  | `4.4.35_ecoo_81092768`，`armv7l`         |
-| 蜂窝模块   | Quectel EC20 / EC25 家族中的兼容型号，需核对实际固件与接口 |
-| USB 标识 | 本例 `2c7c:0125`，以 `lsusb` 的实际结果为准        |
-| 供电     | 建议使用带独立供电的 USB Hub，保证模块供电稳定             |
-| 电脑     | Windows、macOS 或 Linux；首次配置建议保留网线连接      |
-| 通知客户端  | 已安装 Bark 的 iPhone，以及自己的 Bark Device Key |
+| TV box | Huawei Yuebox EC6108V9C; verify the actual SoC and board |
+| System | HiNAS 32-bit, Ubuntu 20.04.6 LTS |
+| Kernel and architecture | `4.4.35_ecoo_81092768`, `armv7l` |
+| Cellular module | A compatible Quectel EC20 / EC25 family model; verify firmware and interfaces |
+| USB identifier | `2c7c:0125` in this example; use the actual `lsusb` result |
+| Power | A separately powered USB hub is recommended for stable module power |
+| Computer | Windows, macOS, or Linux; keep a wired connection during first-time setup |
+| Notification client | An iPhone with Bark installed and your own Bark Device Key |
 
-刷机前必须核对具体板型，不能仅凭盒子的外壳名称选择固件。Hi3797 与 Hi3798 的内核、Wi-Fi 驱动和刷机方式可能不同。
+Verify the exact board before flashing. Do not choose firmware from the enclosure name alone: Hi3797 and Hi3798 may use different kernels, Wi-Fi drivers, and flashing procedures.
 
-### 已验证的运行形态
+### Verified runtime profile
 
-完成部署后，可以用下面的检查结果判断系统是否处于同一类状态：
+After deployment, use these checks to determine whether the system matches the validated profile:
 
-| 项目       | 预期结果                                                         |
+| Item | Expected result |
 | -------- | ------------------------------------------------------------ |
-| 主机       | Ubuntu 20.04.6、ARMv7、旧版 4.4 内核                               |
-| 无线接口     | `wlan0` 由 NetworkManager 管理；有线接口可作为救援链路                      |
-| 蜂窝模块     | `lsusb` 显示 `2c7c:0125`，`option` 驱动绑定到 `ttyUSB0` 至 `ttyUSB4`  |
-| Docker   | `asterisk-quectel:armv7` 镜像、`ast-test` 容器、host 网络、只映射五个串口    |
-| Asterisk | 20.6.0，`chan_quectel.so` 状态为 `Running`                       |
-| 配网       | `box-provision.service` 监听 `127.0.0.1:8765`，Nginx 只对配置热点网段代理 |
+| Host | Ubuntu 20.04.6, ARMv7, legacy 4.4 kernel |
+| Wireless | `wlan0` managed by NetworkManager; Ethernet available as a recovery path |
+| Cellular module | `lsusb` shows `2c7c:0125`; the `option` driver binds `ttyUSB0` through `ttyUSB4` |
+| Docker | `asterisk-quectel:armv7` image, `ast-test` container, host networking, five serial devices mapped |
+| Asterisk | 20.6.0; `chan_quectel.so` reports `Running` |
+| Provisioning | `box-provision.service` listens on `127.0.0.1:8765`; Nginx proxies only the setup-hotspot subnet |
 
 
-整个系统可以按两条流程理解：
+The system can be understood as two flows:
 
 ```text
-短信：SIM 卡 → Quectel 模块 → 宿主机 option 驱动 → ttyUSB
-     → Docker 设备映射 → chan_quectel → Asterisk → Bark → 手机
+SMS: SIM card → Quectel module → host `option` driver → ttyUSB
+     → Docker device mapping → chan_quectel → Asterisk → Bark → phone
 
-管理：通电 → 尝试已保存的 Wi-Fi → 成功：Bark 通知 IP
-                            └→ 失败：开启 Box-Setup 热点 → 网页配网
+Management: power on → try saved Wi-Fi → success: Bark reports the IP
+                                  └→ failure: enable the Box-Setup hotspot → web provisioning
 ```
 
 ```mermaid
 flowchart LR
-    M[Quectel EC20/EC25] --> U[option 驱动]
-    U --> T[/dev/ttyUSB0..4]
+    M[Quectel EC20/EC25] --> U[option driver]
+    U --> T["/dev/ttyUSB0..4"]
     T --> D[Docker ast-test]
     D --> Q[chan_quectel]
     Q --> A[Asterisk]
-    A --> B[Bark 短信推送]
+    A --> B[Bark SMS push]
     W[NetworkManager wlan0] --> P[box-provision]
     P --> N[Nginx :80]
     N --> H[Box-Setup 192.168.50.1]
@@ -60,33 +62,33 @@ flowchart LR
     S --> A
 ```
 
-USB 驱动由宿主机内核管理。容器只能使用宿主机已经识别出的设备，因此不能把 `echo ... > new_id` 放进容器内部，再指望它修复容器创建时缺少串口的问题。
+The USB driver is managed by the host kernel. A container can use only devices already recognized by the host, so placing `echo ... > new_id` inside the container cannot fix missing serial ports during container creation.
 
-本文先完成短信网关，再安装可选的网页配网服务。所有 Linux 命令默认在 **Bash** 中运行；安装服务、写入 `/etc` 与绑定 USB 的步骤均在盒子的 root shell 中执行。Windows 下构建镜像可使用 WSL 的 Bash，Docker Desktop 需切换到 Linux 容器。
+This guide builds the SMS gateway first and then installs the optional web provisioning service. Linux commands assume **Bash**; service installation, writes under `/etc`, and USB binding run from the box's root shell. On Windows, build images from WSL Bash and switch Docker Desktop to Linux containers.
 
-## 2. 刷机并建立第一次 SSH 连接
+## 2. Flash the box and establish the first SSH connection
 
-固件和具体刷机方法参考平台文档：
+Use the platform documentation for firmware and the exact flashing procedure:
 
-- [固件下载](https://www.ecoo.top/download)
-- [机顶盒刷机教程](https://www.ecoo.top/docs/category/%E6%9C%BA%E9%A1%B6%E7%9B%92%E5%88%B7%E6%9C%BA%E6%95%99%E7%A8%8B)
+- [Firmware downloads](https://www.ecoo.top/download)
+- [TV-box flashing guide](https://www.ecoo.top/docs/category/%E6%9C%BA%E9%A1%B6%E7%9B%92%E5%88%B7%E6%9C%BA%E6%95%99%E7%A8%8B)
 
-刷机完成后，可以把盒子通过网线连接到电脑，并将电脑的 Wi-Fi 连接共享给以太网。Windows 网络共享常使用 `192.168.137.0/24`，但盒子的地址由 DHCP 分配，不能固定照抄别人的地址。
+After flashing, connect the box to the computer by Ethernet and share the computer's Wi-Fi connection to Ethernet. Windows Internet Connection Sharing often uses `192.168.137.0/24`, but DHCP assigns the box address; do not copy another device's address.
 
-在 Windows PowerShell 查看相邻设备：
+Find neighboring devices from Windows PowerShell:
 
 ```powershell
 Get-NetNeighbor -AddressFamily IPv4
 arp -a
 ```
 
-找到盒子的 IP 后连接。以下地址只是示例，请替换：
+Connect after finding the box IP. The address below is an example; replace it:
 
 ```bash
 ssh root@192.168.137.100
 ```
 
-登录后记录系统信息，并设置自己的登录密码：
+Record system information and set your own login password after signing in:
 
 ```bash
 uname -a
@@ -96,7 +98,7 @@ ip -br address
 passwd
 ```
 
-安装基础工具。设备已有 Docker 时保留现有安装，不需要重复安装另一套 Docker：
+Install the basic tools. If Docker is already present, keep that installation instead of installing a second one:
 
 ```bash
 apt update
@@ -107,18 +109,18 @@ docker version
 docker info
 ```
 
-如果 `docker` 尚未安装，优先采用该固件说明中适配 ARMv7 和旧内核的安装方式。发行版仓库提供兼容包时，可使用 `apt install docker.io`，然后执行 `systemctl enable --now docker`。仅有 Docker 客户端并不足够，`docker info` 必须能连接服务端。
+If `docker` is not installed, prefer the firmware's ARMv7/legacy-kernel instructions. When the distribution provides a compatible package, use `apt install docker.io` followed by `systemctl enable --now docker`. A Docker client alone is insufficient; `docker info` must reach the daemon.
 
-构建和运行镜像前确认架构没有被误识别为 `amd64`：
+Before building or running images, confirm that the architecture was not misdetected as `amd64`:
 
 ```bash
 docker version --format 'server={{.Server.Version}} client={{.Client.Version}}'
 docker info --format 'arch={{.Architecture}} os={{.OperatingSystem}} kernel={{.KernelVersion}}'
 ```
 
-本文验证设备使用 Docker 26.1.3、`armv7l` 和 4.4.35 内核。旧内核能运行较新的 Docker，并不代表每个新镜像都兼容；遇到容器启动异常时应先检查 libc、设备权限和内核特性。
+The validated device uses Docker 26.1.3, `armv7l`, and a 4.4.35 kernel. A newer Docker may run on an old kernel, but that does not make every new image compatible; check libc, device permissions, and kernel features when containers fail to start.
 
-第一次登录使用临时密码即可。完成公钥登录验证后，应关闭 root 密码登录或至少限制 SSH 来源网段：
+Use a temporary password for the first login. After verifying public-key access, disable root password login or at least restrict the SSH source subnet:
 
 ```bash
 install -d -m 0700 /root/.ssh
@@ -126,16 +128,16 @@ chmod 0600 /root/.ssh/authorized_keys
 sshd -t
 ```
 
-修改 `sshd_config` 前保留一个已登录的救援会话，并在新会话中验证密钥；不要在唯一 SSH 连接里直接重启 SSH。
+Keep an authenticated recovery session open while editing `sshd_config`, and verify the key in a new session. Do not restart SSH from your only connection.
 
-### 2.1 确认 Wi-Fi 驱动和连接配置
+### 2.1 Verify the Wi-Fi driver and connection profile
 
 ```bash
 nmcli device status
 ip -br link
 ```
 
-如果固件缺少 Wi-Fi 驱动，可以检查针对 Hi3798MV100 的驱动脚本。先阅读安装脚本，确认板型与内核适配，再执行：
+If the firmware lacks a Wi-Fi driver, inspect the driver script for Hi3798MV100. Read it first and confirm the board/kernel match before running it:
 
 ```bash
 git clone https://gitee.com/xjxjin/scripts.git
@@ -145,9 +147,9 @@ sudo ./install_hi3798mv100_wifi.sh
 sudo depmod -a
 ```
 
-不要把某个设备的 `/lib/modules/4.4.35_...` 路径硬编码到所有盒子。当前模块目录应与 `uname -r` 一致；仅创建目录并不能补齐缺失的驱动。
+Do not hard-code one device's `/lib/modules/4.4.35_...` path for every box. The module directory must match `uname -r`; creating a directory alone cannot supply a missing driver.
 
-首次可以通过网线 SSH 配置无线网络：
+You can configure Wi-Fi over the wired SSH connection:
 
 ```bash
 nmcli device wifi rescan ifname wlan0
@@ -157,15 +159,15 @@ nmcli connection modify home-wifi connection.autoconnect yes
 nmcli connection modify home-wifi ipv4.route-metric 50
 ```
 
-`MyHomeWiFi` 是示例 SSID，`home-wifi` 是 NetworkManager 的连接配置名，两者不必相同。`connection modify` 接收的是配置名或 UUID。路由 metric 越小优先级越高；是否让 Wi-Fi 优先于网线，应按实际网络选择。
+`MyHomeWiFi` is an example SSID and `home-wifi` is the NetworkManager connection name; they do not have to match. `connection modify` accepts a profile name or UUID. A lower route metric has higher priority; choose Wi-Fi versus Ethernet priority for your network.
 
-改完连接属性通常在下次激活时生效。远程配置期间保留网线，再执行 `nmcli connection up home-wifi`；直接重启整个 NetworkManager 可能使当前 SSH 中断。
+Connection changes usually take effect on the next activation. Keep Ethernet connected during remote setup and run `nmcli connection up home-wifi`; restarting NetworkManager can interrupt the current SSH session.
 
-## 3. 先让宿主机出现 ttyUSB
+## 3. Make ttyUSB devices appear on the host
 
-### 3.1 区分 USB 枚举与串口绑定
+### 3.1 Distinguish USB enumeration from serial binding
 
-先检查模块是否已被 USB 总线识别：
+First check whether the module is recognized on the USB bus:
 
 ```bash
 lsusb
@@ -173,9 +175,9 @@ lsusb -t
 dmesg | tail -80
 ```
 
-本例设备的 VID/PID 为 `2c7c:0125`，实测设备在 Asterisk 中显示为 EC20F。仅凭 USB ID 仍不足以确认硬件变体，必要时可通过模块标签或 AT 命令 `ATI` 核对。
+This device uses VID/PID `2c7c:0125` and appeared as EC20F in Asterisk. A USB ID alone cannot confirm the hardware variant; use the module label or the `ATI` AT command when necessary.
 
-如果 `lsusb` 中已经存在该设备，但没有 `/dev/ttyUSB*`，在**宿主机**执行：
+If `lsusb` lists the device but `/dev/ttyUSB*` is absent, run this on the **host**:
 
 ```bash
 modprobe usbserial
@@ -186,21 +188,21 @@ ls -l /dev/ttyUSB*
 dmesg | tail -50
 ```
 
-本次实机最终出现了 `/dev/ttyUSB0` 到 `/dev/ttyUSB4`。其他固件的 USB 接口组合可能不同，不能把“五个端口”当作所有 EC20 / EC25 的固定规格。
+The tested device ultimately exposed `/dev/ttyUSB0` through `/dev/ttyUSB4`. Other firmware may expose a different USB interface set; do not treat five ports as a fixed EC20/EC25 specification.
 
-`new_id` 用于向运行中的驱动注册设备 ID，这个动态注册不能替代持久化启动配置。也不要用 `cat .../new_id` 判断是否绑定成功；应检查字符设备、驱动链接和内核日志。
+`new_id` registers a device ID with the running driver. This dynamic registration is not a persistent boot configuration. Do not use `cat .../new_id` to decide whether binding succeeded; inspect character devices, driver links, and kernel logs.
 
-如果使用普通用户，重定向也需要 root 权限：
+When using a non-root shell, the redirection still needs root privileges:
 
 ```bash
 printf '2c7c 0125\n' | sudo tee /sys/bus/usb-serial/drivers/option1/new_id >/dev/null
 ```
 
-**如果 `lsusb` 根本看不到模块，先检查供电、数据线和 USB Hub。** 某些设备的 USB 模块可能在开机很久以后才完成枚举；写入 `new_id` 无法让一个尚未枚举的 USB 设备凭空出现，应先从硬件和内核 USB 日志排查。
+**If `lsusb` does not show the module at all, check power, the data cable, and the USB hub first.** Some devices enumerate their USB module long after boot; writing `new_id` cannot make an unenumerated device appear. Check the hardware and kernel USB logs first.
 
-### 3.2 写一个每次启动都执行的准备脚本
+### 3.2 Create a preparation script that runs on every boot
 
-创建 `/usr/local/sbin/quectel-usb-prepare.sh`：
+Create `/usr/local/sbin/quectel-usb-prepare.sh`:
 
 ```bash
 cat > /usr/local/sbin/quectel-usb-prepare.sh <<'EOF'
@@ -253,19 +255,19 @@ chmod 0755 /usr/local/sbin/quectel-usb-prepare.sh
 /usr/local/sbin/quectel-usb-prepare.sh
 ```
 
-脚本每次都会尝试执行核心的 `echo`，然后检查五个串口是否为字符设备、是否属于目标 VID/PID。某些厂商内核把驱动直接编入内核，因此以 `new_id` 接口实际存在为准，而不只看 `modprobe` 的返回值。等待约 30 秒仍不满足条件时返回失败，由后面的 systemd 服务重试。
+On every run the script attempts the essential `echo`, then checks that all five ports are character devices belonging to the target VID/PID. Some vendor kernels build the driver in, so the presence of the `new_id` interface matters more than the `modprobe` return value. If the ports are not ready after about 30 seconds, the script fails and the later systemd unit retries.
 
-这里假定只连接一只蜂窝模块，而且端口固定为 `ttyUSB0–4`。如果有多只 USB 串口设备，应根据 `/dev/serial/by-id/` 或 USB 接口号建立稳定别名，并同步修改准备脚本、容器映射和 `quectel.conf`，避免端口编号变化后连接错设备。
+This assumes one cellular module with fixed ports `ttyUSB0–4`. With multiple USB serial devices, create stable aliases from `/dev/serial/by-id/` or USB interface numbers and update the preparation script, container mapping, and `quectel.conf` together.
 
-## 4. 构建 ARMv7 的 Asterisk + chan_quectel 镜像
+## 4. Build the ARMv7 Asterisk + chan_quectel image
 
-这一节提供一种可复建的参考路径：使用 Debian Bullseye 的 Asterisk 与匹配的开发头文件，在容器中编译 `chan_quectel`。它不要求在电视盒子上编译整套 Asterisk。目标设备上实际运行的是 Asterisk 20.6.0，因此构建时应让 `--with-astversion` 与镜像里的版本完全一致。
+This section gives a reproducible reference path: compile `chan_quectel` in a container using Debian Bullseye Asterisk and matching development headers. You do not need to compile all of Asterisk on the TV box. The target runs Asterisk 20.6.0, so `--with-astversion` must exactly match the version inside the image.
 
-本文使用公开的 [IchthysMaranatha/asterisk-chan-quectel](https://github.com/IchthysMaranatha/asterisk-chan-quectel) 作为构建示例，并固定一个提交。生产环境应把经过测试的提交、基础镜像 digest 和 Asterisk 版本一起记录。
+This guide uses the public [IchthysMaranatha/asterisk-chan-quectel](https://github.com/IchthysMaranatha/asterisk-chan-quectel) repository and pins one commit. In production, record the tested commit, base-image digest, and Asterisk version together.
 
-### 4.1 创建 Dockerfile
+### 4.1 Create the Dockerfile
 
-在用于构建镜像的电脑或 ARMv7 设备上执行：
+Run this on the image-building computer or an ARMv7 device:
 
 ```bash
 mkdir -p ast-build
@@ -305,19 +307,19 @@ CMD ["tail", "-f", "/dev/null"]
 EOF
 ```
 
-`--with-astversion` 必须对应容器内实际安装的 Asterisk 版本，不能把 README 的示例版本原样写死。`libasound2-dev` 用于构建该分支包含的 ALSA 支持，运行时保留 `libasound2`。
+`--with-astversion` must match the Asterisk version actually installed in the container; do not hard-code the example version from this README. `libasound2-dev` builds the ALSA support included by this branch; `libasound2` remains at runtime.
 
-此 Dockerfile 固定了驱动提交，但没有固定基础镜像 digest 和发行版软件包版本。它会使用 Debian Bullseye 软件源提供的 Asterisk 版本；构建后必须用 `docker run --rm asterisk-quectel:armv7 asterisk -V` 核对版本，并让 `--with-astversion` 与该输出保持一致。目标环境已经验收的是 Asterisk 20.6.0；如果构建机得到其他版本，不要把它当作 20.6.0 的可替代镜像，应改用固定的 Asterisk 20.6.0 包或源码重新构建。需要长期重复构建时，还应保存基础镜像 digest 和发行版软件包版本；升级 Asterisk 后也要重新构建匹配的驱动。
+The Dockerfile pins the driver commit but not the base-image digest or distribution package versions. It uses the Asterisk version available from Debian Bullseye; after building, verify it with `docker run --rm asterisk-quectel:armv7 asterisk -V` and keep `--with-astversion` aligned. The target environment was validated with Asterisk 20.6.0; if the builder produces another version, do not treat it as a drop-in replacement. Rebuild with a pinned Asterisk 20.6.0 package or source. For repeatable builds, also save the base-image digest and distribution package versions; rebuild the matching driver after upgrading Asterisk.
 
-### 4.2 选择正确的构建平台
+### 4.2 Choose the correct build platform
 
-在原生 ARMv7 Linux 上可以直接构建：
+On native ARMv7 Linux, build directly:
 
 ```bash
 docker build -t asterisk-quectel:armv7 .
 ```
 
-在 Windows / macOS 的 Docker Desktop 或已配置 ARM 模拟器的 Linux 构建机上：
+On Docker Desktop for Windows/macOS or a Linux builder configured for ARM emulation:
 
 ```bash
 docker buildx inspect --bootstrap
@@ -327,9 +329,9 @@ docker image inspect asterisk-quectel:armv7 \
   --format '{{.Os}}/{{.Architecture}}/{{.Variant}}'
 ```
 
-构建器需要支持 `linux/arm/v7`。仅使用 `debian:bullseye` 不会自动让 x86 电脑生成 ARM 镜像；`--platform` 也不会自动解决所有构建机的模拟器配置问题。旧版 Docker 不支持 Buildx 时，可使用原生 ARMv7 机器构建。
+The builder must support `linux/arm/v7`. Using only `debian:bullseye` does not make an x86 computer produce an ARM image, and `--platform` does not configure every emulator automatically. If the Docker version lacks Buildx, build on a native ARMv7 machine.
 
-将镜像传给盒子。先设置实际地址：
+Copy the image to the box. Set the real address first:
 
 ```bash
 BOX_ADDR=192.168.137.100
@@ -337,20 +339,20 @@ docker save asterisk-quectel:armv7 | gzip > asterisk-quectel-armv7.tar.gz
 scp asterisk-quectel-armv7.tar.gz "root@$BOX_ADDR:/root/"
 ```
 
-在盒子上导入：
+Import it on the box:
 
 ```bash
 gzip -dc /root/asterisk-quectel-armv7.tar.gz | docker load
 docker run --rm asterisk-quectel:armv7 asterisk -V
 ```
 
-此处验证版本的临时容器不使用 USB，所以无需绑定串口。后续启动使用蜂窝模块的 `ast-test` 容器才必须先准备 USB。
+The temporary version-check container does not use USB, so it needs no serial mapping. The later `ast-test` container that uses the cellular module must prepare USB first.
 
-## 5. 准备持久化配置和 Bark 通知
+## 5. Prepare persistent configuration and Bark notifications
 
-### 5.1 建立数据目录
+### 5.1 Create data directories
 
-下列步骤面向新部署。已有 `ast-test` 的设备应先备份现有配置和容器信息，不要直接用新配置覆盖。
+These steps target a new deployment. Back up the existing configuration and container metadata on devices that already have `ast-test`; do not overwrite them directly.
 
 ```bash
 install -d -m 0755 /opt/asterisk/etc /opt/asterisk/bin
@@ -364,11 +366,11 @@ docker cp ast-config-seed:/var/spool/asterisk/. /opt/asterisk/spool/
 docker rm ast-config-seed
 ```
 
-先从镜像取出默认配置，再绑定目录。直接把一个空目录挂到 `/etc/asterisk`，会遮住镜像里原有的全部配置。
+Extract the default configuration from the image before binding directories. Mounting an empty directory on `/etc/asterisk` hides all configuration shipped in the image.
 
-### 5.2 保存 Bark Key
+### 5.2 Store the Bark key
 
-在盒子的 Bash 中输入自己的 Key，输入过程不回显：
+Enter your own key in the box's Bash; input is hidden:
 
 ```bash
 read -r -s -p 'Bark Device Key: ' BARK_DEVICE_KEY
@@ -378,11 +380,11 @@ test -n "$BARK_DEVICE_KEY" && \
 unset BARK_DEVICE_KEY
 ```
 
-Key 单独保存在宿主机，并以只读目录挂载进入容器。不要将真实 Key 写进 Dockerfile、截图或准备公开的文章。
+Keep the key on the host and mount it read-only into the container. Never put a real key in the Dockerfile, screenshots, or a document intended for publication.
 
-### 5.3 安装通用推送脚本
+### 5.3 Install the shared notification script
 
-创建 `/opt/asterisk/bin/bark-notify`，供宿主机的联网通知和容器内的短信通知共用：
+Create `/opt/asterisk/bin/bark-notify` for both host network notifications and SMS notifications inside the container:
 
 ```bash
 cat > /opt/asterisk/bin/bark-notify <<'EOF'
@@ -400,7 +402,7 @@ def main():
     if sys.argv[1] == "--sms":
         sender, encoded = sys.argv[2:4]
         body = base64.b64decode(encoded, validate=True).decode("utf-8", errors="replace")
-        title, group = "短信：" + (sender or "未知号码"), "SMS"
+        title, group = "SMS: " + (sender or "Unknown number"), "SMS"
     else:
         title, body, group = sys.argv[1:4]
     key = Path("/etc/box-provision/bark-key").read_text(encoding="utf-8").strip()
@@ -434,29 +436,29 @@ if __name__ == "__main__":
 EOF
 chmod 0755 /opt/asterisk/bin/bark-notify
 ln -sfn /opt/asterisk/bin/bark-notify /usr/local/bin/bark-notify
-/usr/local/bin/bark-notify '盒子通知测试' 'Bark 配置成功' box
+/usr/local/bin/bark-notify 'Box notification test' 'Bark setup succeeded' box
 ```
 
-使用 JSON 序列化可以正确处理短信中的双引号、换行和中文；直接把短信插入 shell 拼接的 JSON 容易生成无效请求。脚本同时检查 HTTP 请求和 Bark 返回的业务状态，避免将失败误报为成功。
+JSON serialization handles quotes, newlines, and non-ASCII SMS correctly; concatenating SMS text into shell-built JSON can create invalid requests. The script checks both the HTTP request and Bark's application status so failures are not reported as successes.
 
-`group` 用于通知分组，`ttl` 是推送有效期相关参数，不是本地重试时间，也不等于短信自动删除时间。这个简化脚本最多尝试三次，没有持久化投递队列；需要可靠补发时应再增加本地队列与投递记录。
+`group` controls notification grouping. `ttl` concerns push expiry; it is not the local retry delay or SMS deletion time. This simplified script tries at most three times and has no persistent delivery queue; add a local queue and delivery records when reliable replay is required.
 
-不要把 Key 写在 `notify.sh`、Asterisk 配置或镜像层中。已经这样部署过的镜像即使删除脚本中的字符串，也不能撤销已经泄露的凭据；应先在 Bark 端轮换 Key，再重建镜像或用只读文件挂载新 Key。
+Do not put the key in `notify.sh`, Asterisk configuration, or an image layer. Deleting the string later cannot revoke credentials already exposed in a built image; rotate the key in Bark first, then rebuild or mount the replacement through a read-only file.
 
-## 6. 配置 chan_quectel 和短信拨号计划
+## 6. Configure chan_quectel and the SMS dial plan
 
-### 6.1 选择数据端口与音频端口
+### 6.1 Choose data and audio ports
 
-EC20/EC25 的常见配置为：
+A common EC20/EC25 configuration is:
 
 ```ini
 data=/dev/ttyUSB2
 audio=/dev/ttyUSB1
 ```
 
-这是接口示例，不代表所有模块都按此编号。`data` 是 AT 命令端口，`audio` 是相应固件支持的串行音频接口；UAC 模式还需要音频设备和对应配置。本文以短信接收为目标，不保证语音通话、VoLTE 或特定音频模式已可用。
+These are interface examples, not a universal numbering scheme. `data` is the AT-command port; `audio` is the serial audio interface supported by the firmware. UAC mode also needs an audio device and matching configuration. This guide targets SMS reception and does not guarantee voice calls, VoLTE, or a particular audio mode.
 
-创建 `/opt/asterisk/etc/quectel.conf`：
+Create `/opt/asterisk/etc/quectel.conf`:
 
 ```bash
 cat > /opt/asterisk/etc/quectel.conf <<'EOF'
@@ -486,11 +488,11 @@ context=from-quectel
 EOF
 ```
 
-这里先使用 `autodeletesms=no`，便于调试期间保留模块中的短信。长期运行需要管理短信存储容量；改为 `yes` 后，驱动删除短信与 Bark 是否成功送达不是一项原子操作，不能把它当作可靠消息队列。不要照抄模块返回的 IMEI/IMSI 到配置文件，驱动无法识别的 `auto` 值会产生警告，省略这两项更稳妥。
+The example starts with `autodeletesms=no` so module SMS messages remain available during debugging. Long-running deployments must manage message-store capacity; with `yes`, driver deletion and Bark delivery are not atomic and cannot act as a reliable queue. Do not copy module-reported IMEI/IMSI values into the configuration; unsupported `auto` values produce warnings, so omitting these options is safer.
 
-### 6.2 只将过滤后的参数传给外部脚本
+### 6.2 Pass only filtered arguments to external scripts
 
-创建 `/opt/asterisk/etc/extensions.conf`。以下内容会替换新部署的默认拨号计划：
+Create `/opt/asterisk/etc/extensions.conf`. This replaces the default dial plan in a new deployment:
 
 ```bash
 cat > /opt/asterisk/etc/extensions.conf <<'EOF'
@@ -513,13 +515,13 @@ exten => ussd,1,Hangup()
 EOF
 ```
 
-当前驱动把短信正文放在 `${SMS}`，拨号计划先用 `BASE64_ENCODE()` 转成只含安全字符的参数，再交给 Python 脚本解码并生成 JSON。不要把 `${SMS}` 或 `${BASE64_DECODE(...)}` 解码后的短信正文直接插入 `System()`：短信属于外部输入，可能包含 shell 特殊字符。
+The current driver puts the SMS body in `${SMS}`. The dial plan first encodes it with `BASE64_ENCODE()` so the argument contains safe characters, then the Python script decodes it and creates JSON. Never place `${SMS}` or decoded `${BASE64_DECODE(...)}` text directly in `System()`: SMS is external input and may contain shell metacharacters.
 
-本例过滤号码后，带中文或标点的发送者名称可能无法完整保留；如需保留完整字段，建议改为 AGI，通过协议传递数据，避免将未过滤内容拼进 shell。
+The example filters the number, so a sender name containing Chinese characters or punctuation may not be preserved fully. To keep the complete field, use AGI and pass data through its protocol instead of putting unfiltered content into a shell command.
 
-### 6.3 控制加载的模块和配置权限
+### 6.3 Control loaded modules and configuration permissions
 
-在新部署的 `/opt/asterisk/etc/modules.conf` 中使用：
+Use this in a new `/opt/asterisk/etc/modules.conf`:
 
 ```ini
 [modules]
@@ -534,7 +536,7 @@ noload=cdr_sqlite3_custom.so
 noload=cel_sqlite3_custom.so
 ```
 
-确保 `/opt/asterisk/etc/manager.conf` 的 `[general]` 中是 `enabled=no`，`/opt/asterisk/etc/http.conf` 的 `[general]` 中也是 `enabled=no`。短信网关不需要对外开放 AMI、ARI、SIP 或 IAX 服务。`autoload=yes` 下不同版本仍可能加载其他模块，所以启动后要实际检查监听端口。
+Ensure `[general]` in `/opt/asterisk/etc/manager.conf` has `enabled=no`, and `[general]` in `/opt/asterisk/etc/http.conf` also has `enabled=no`. An SMS gateway does not need public AMI, ARI, SIP, or IAX services. With `autoload=yes`, different versions may still load other modules, so inspect listening ports after startup.
 
 ```bash
 chown -R root:root /opt/asterisk/etc /opt/asterisk/bin /etc/box-provision
@@ -544,13 +546,13 @@ chmod 0700 /etc/box-provision
 chmod 0600 /etc/box-provision/bark-key
 ```
 
-系统启动时可能出现 `cdr_sqlite3_custom`、`cel_sqlite3_custom` 拒绝加载，同时仍然出现 `Asterisk Ready`。这两条错误不能单独证明 Asterisk 启动失败；不使用这类通话记录后端时，可以明确禁用。
+At boot, `cdr_sqlite3_custom` and `cel_sqlite3_custom` may refuse to load while `Asterisk Ready` still appears. Those messages alone do not prove startup failed; explicitly disable these backends when they are not used.
 
-## 7. 创建容器，由 systemd 负责启动顺序
+## 7. Create the container and let systemd control startup order
 
-### 7.1 创建使用 USB 的业务容器
+### 7.1 Create the USB-enabled service container
 
-先运行准备脚本，成功后再创建容器：
+Run the preparation script successfully before creating the container:
 
 ```bash
 /usr/local/sbin/quectel-usb-prepare.sh && \
@@ -572,15 +574,15 @@ docker create --name ast-test \
   asterisk-quectel:armv7
 ```
 
-这里不使用 `--privileged`，只映射需要的串口。`--network host` 沿用原设备的部署方式，容器共享宿主机网络，内部监听的服务也可能直接暴露在盒子地址上，因此前面的服务关闭和端口检查不能省略。
+This uses no `--privileged`; only the required serial devices are mapped. `--network host` follows the original deployment, so services listening inside the container may be reachable on the box address; keep the service shutdown and port checks above.
 
-`--restart=no` 是启动顺序的一部分：由 systemd 在 USB 准备成功之后启动业务容器，避免 Docker 自己先执行自动重启。已有容器可以先通过 `docker inspect` 查看，再用 `docker update --restart=no ast-test` 统一交给 systemd 管理。
+`--restart=no` is part of the startup ordering: systemd starts the service container after USB preparation, instead of Docker performing an early automatic restart. Inspect an existing container with `docker inspect`, then use `docker update --restart=no ast-test` to hand lifecycle control to systemd.
 
-设备上的工作容器名为 `ast-test`，镜像是 `asterisk-quectel:armv7`，命令是 `tail -f /dev/null`，Asterisk 由宿主机的 systemd 通过 `docker exec` 以前台模式运行。容器使用 host 网络、没有启用 `--privileged`，并映射 `/dev/ttyUSB0` 至 `/dev/ttyUSB4`。这种“容器提供用户态环境、systemd 托管主进程”的结构可以工作，但容器里的配置随镜像发布，升级配置时必须重新构建或重建容器。上面的示例增加了只读配置和 Bark Key 挂载，便于轮换密钥和备份配置。
+The working container is named `ast-test`, uses image `asterisk-quectel:armv7`, runs `tail -f /dev/null`, and lets host systemd run Asterisk in the foreground through `docker exec`. It uses host networking, no `--privileged`, and maps `/dev/ttyUSB0` through `/dev/ttyUSB4`. This “userspace in a container, main process supervised by systemd” layout works, but configuration ships with the image; rebuild or recreate the container when upgrading it. The example adds read-only configuration and Bark-key mounts for rotation and backup.
 
-### 7.2 安装启动前检查
+### 7.2 Install the pre-start check
 
-创建 `/usr/local/sbin/ast-test-security-check`：
+Create `/usr/local/sbin/ast-test-security-check`:
 
 ```bash
 cat > /usr/local/sbin/ast-test-security-check <<'EOF'
@@ -616,11 +618,11 @@ EOF
 chmod 0755 /usr/local/sbin/ast-test-security-check
 ```
 
-它检查镜像名称、特权模式、重启策略、设备映射与配置权限。镜像名称检查用于防止用错镜像，不代表验证了镜像签名或来源，也不能替代完整安全审计。
+It checks the image name, privileged mode, restart policy, device mappings, and configuration permissions. The image-name check prevents using the wrong image; it does not verify signatures or provenance and is not a complete security audit.
 
-### 7.3 安装 Asterisk 自启动服务
+### 7.3 Install the Asterisk startup service
 
-创建 `/etc/systemd/system/ast-test-asterisk.service`：
+Create `/etc/systemd/system/ast-test-asterisk.service`:
 
 ```ini
 [Unit]
@@ -648,20 +650,20 @@ KillMode=process
 WantedBy=multi-user.target
 ```
 
-这份参考配置的顺序是：
+The reference order is:
 
 ```text
-加载驱动 → 每次写入 new_id → 等待并核对 ttyUSB
-        → 检查容器配置 → docker start → 核对容器内串口 → Asterisk 前台运行
+load driver → write new_id on every run → wait for and verify ttyUSB
+        → check container configuration → docker start → verify container serial ports → run Asterisk in foreground
 ```
 
-`StartLimitIntervalSec=0` 应写在 `[Unit]` 中。单元文件里的 `$$n` 用来把 `$n` 传给内部 shell，避免被 systemd 当作环境变量处理。启动前脚本返回失败时，后续 `docker start` 不执行；服务等待 15 秒后重试。USB 模块迟到时只影响这个业务服务，无需阻塞整个 Docker 服务。
+Keep `StartLimitIntervalSec=0` in `[Unit]`. `$$n` in the unit file passes `$n` to the inner shell without systemd treating it as an environment variable. If a pre-start check fails, `docker start` is skipped; the service retries after 15 seconds. A late USB module affects only this service and does not block Docker itself.
 
-`asterisk -f` 保持前台运行，让 systemd 通过 `docker exec` 观察进程退出。`ExecStopPost` 在服务停止后关闭业务容器，使下次启动重新设置设备映射；`Restart=always` 会恢复正常或异常退出的进程，但管理员执行 `systemctl stop` 时不会立即重启。
+`asterisk -f` keeps Asterisk in the foreground so systemd can observe its exit through `docker exec`. `ExecStopPost` stops the service container so the next start recreates device mappings; `Restart=always` recovers normal or abnormal exits, while an administrator's `systemctl stop` does not immediately restart it.
 
-参考单元会先执行 USB 准备和安全检查，再按需启动 `ast-test`，随后运行 Asterisk。已有设备应通过 `systemctl cat ast-test-asterisk.service` 核对实际顺序；服务日志应能看到安全检查通过。若容器的 Docker 重启策略仍是 `always`，Docker 守护进程重启时可能绕过 systemd 前置脚本。需要严格保证“每次容器启动前写入 `new_id`”时，应把容器策略设为 `no`，只让 systemd 管理容器生命周期。
+The reference unit runs USB preparation and security checks, starts `ast-test` if needed, and then runs Asterisk. On an existing device, compare the actual order with `systemctl cat ast-test-asterisk.service`; the service log should show the security check passing. If Docker's restart policy remains `always`, a Docker daemon restart may bypass systemd pre-checks. To guarantee that `new_id` is written before every container start, set the container policy to `no` and let systemd own its lifecycle.
 
-启用服务：
+Enable the service:
 
 ```bash
 systemctl daemon-reload
@@ -669,15 +671,15 @@ systemctl enable --now ast-test-asterisk.service
 systemctl status ast-test-asterisk.service --no-pager -l
 ```
 
-今后统一使用：
+Use this entry point from now on:
 
 ```bash
 systemctl restart ast-test-asterisk.service
 ```
 
-**直接运行 `docker start ast-test` 或 `docker restart ast-test` 会绕过这些前置步骤。** Docker 没有自动调用该 systemd 单元的机制；“每次先 echo”的保证依赖于统一使用此入口，并关闭 Docker 自身的自动重启策略。
+**Running `docker start ast-test` or `docker restart ast-test` directly bypasses these pre-start steps.** Docker does not automatically invoke this systemd unit; the “echo first every time” guarantee depends on using this entry point and disabling Docker's automatic restart policy.
 
-### 7.4 验证业务，而不仅是容器状态
+### 7.4 Verify the service, not only the container state
 
 ```bash
 docker exec ast-test ls -l /dev/ttyUSB0 /dev/ttyUSB1 /dev/ttyUSB2 /dev/ttyUSB3 /dev/ttyUSB4
@@ -689,29 +691,29 @@ journalctl -u ast-test-asterisk.service -n 80 --no-pager
 ss -lntup
 ```
 
-`docker ps` 中显示 `Up` 只说明本例的 `sleep infinity` 还在运行，不能证明 Asterisk 或蜂窝模块健康。确认模块正常注册后，向 SIM 卡发送一条测试短信，检查 Bark 收到的内容。
+`Up` in `docker ps` only means this example's `sleep infinity` is still running; it does not prove Asterisk or the cellular module is healthy. After the module registers, send a test SMS to the SIM and verify the Bark content.
 
 
-## 8. 可选：网页配置 Wi-Fi，联网后通知 IP
+## 8. Optional: configure Wi-Fi through a web page and notify the IP
 
-### 8.1 单网卡切换的限制
+### 8.1 Limitations of single-radio switching
 
-这台盒子的 Wi-Fi 同时承担热点和连接路由器的任务。常见旧驱动无法稳定地同时进行 AP 与 STA 工作，热点运行期间的扫描缓存也可能不完整。
+This box's Wi-Fi radio handles both the setup hotspot and the router connection. Common legacy drivers cannot reliably operate AP and STA at the same time, and scan results may be incomplete while the hotspot is active.
 
-因此建议采用如下流程：
+Recommended flow:
 
-1. 开机先尝试已保存的普通 Wi-Fi；有配置时等待一个有限时间。
-2. 没有可用连接时，开启 `Box-Setup` 热点。
-3. 手机或电脑连上热点，访问 `http://192.168.50.1`。
-4. 网页先确认收到配网请求，再由后台关闭热点、切换到目标 Wi-Fi。
-5. 成功后由 Bark 通知地址；失败则恢复热点。
-6. 电脑切换到目标 Wi-Fi 后，使用通知中的 IP 或 `.local` 主机名 SSH。
+1. On boot, try the saved normal Wi-Fi and wait only a limited time.
+2. If no connection is available, enable the `Box-Setup` hotspot.
+3. Connect a phone or computer to the hotspot and open `http://192.168.50.1`.
+4. Let the page acknowledge the request, then let the backend stop the hotspot and switch to the target Wi-Fi.
+5. Bark reports the address on success; failure restores the hotspot.
+6. After the computer joins the target Wi-Fi, SSH using the notified IP or the `.local` hostname.
 
-热点关闭时浏览器会断线，所以不能保证它还能收到新网络上的 IP。让页面一直轮询并不能消除这种链路中断。没有外网时，Bark 也无法送达，需要通过路由器 DHCP 租约或网线找回设备。
+The browser disconnects when the hotspot stops, so it cannot reliably receive the IP on the new network. Polling the page continuously cannot remove that link break. Without Internet access, Bark cannot deliver; recover the box from the router's DHCP lease or by Ethernet.
 
-### 8.2 创建带密码的配网热点
+### 8.2 Create a password-protected setup hotspot
 
-先确认网卡支持 AP 模式，网卡名称不是 `wlan0` 时同步修改后续配置。当前设备使用 Realtek USB 无线网卡和 `wlan0`，NetworkManager 中的 `Box-Setup` 是 `192.168.50.1/24` 的 shared AP 配置，默认没有自动连接。
+First verify AP support, and update later configuration if the interface is not `wlan0`. The validated device uses a Realtek USB adapter and `wlan0`; NetworkManager's `Box-Setup` is a shared AP at `192.168.50.1/24` with autoconnect disabled.
 
 ```bash
 apt install -y iw
@@ -719,7 +721,7 @@ iw list
 nmcli device status
 ```
 
-在 `Supported interface modes` 中寻找 `AP`。以下配置固定使用 2.4 GHz，并禁用热点自动抢占普通 Wi-Fi：
+Look for `AP` under `Supported interface modes`. The configuration below fixes 2.4 GHz and prevents the hotspot from automatically taking priority over normal Wi-Fi:
 
 ```bash
 nmcli connection add type wifi ifname wlan0 con-name Box-Setup ssid Box-Setup
@@ -727,25 +729,25 @@ nmcli connection modify Box-Setup \
   802-11-wireless.mode ap 802-11-wireless.band bg \
   ipv4.method shared ipv4.addresses 192.168.50.1/24 \
   ipv6.method disabled connection.autoconnect no
-read -r -s -p '设置 8–63 个 ASCII 字符的热点密码: ' SETUP_PSK
+read -r -s -p 'Set an 8–63 character ASCII hotspot password: ' SETUP_PSK
 printf '\n'
 nmcli connection modify Box-Setup wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$SETUP_PSK"
 unset SETUP_PSK
 ```
 
-如果已有同名热点，修改现有连接即可，不要重复创建。NetworkManager 的 shared 模式负责 DHCP 和共享配置；部分发行版还需要安装 `dnsmasq-base`，不要再启一个占用相同端口的独立 DHCP 服务。开放热点只适合第一次救援，长期运行应设置 WPA2-PSK，并在页面中说明热点密码。
+If a hotspot with this name already exists, modify it instead of creating a duplicate. NetworkManager shared mode provides DHCP and sharing; some distributions also need `dnsmasq-base`, but do not start another DHCP service on the same ports. An open hotspot is suitable only for first-time recovery; use WPA2-PSK for long-term operation and document the hotspot password in the page.
 
-配置热点之前先检查本机已有的 Web 站点。一个 Nginx 实例只能由一个 default server 接收同一端口的默认请求；不要让已有的 PHP、WebDAV 或公网域名站点意外接管配网页面。配网盒子只需要一个限制来源网段的 server 块，其他站点应停用或明确绑定到不同端口。
+Inspect existing web sites before configuring the hotspot. One Nginx instance can have only one default server for a port; do not let an existing PHP, WebDAV, or public-domain site take over the provisioning page. The provisioning box needs one server block restricted by source subnet; disable other sites or bind them to another port.
 
-配网页面提交的是目标 Wi-Fi 密码，因此热点本身也应使用 WPA2-PSK，并且只允许自己的终端接入。
+The provisioning page accepts the target Wi-Fi password, so the hotspot itself should use WPA2-PSK and allow only your own devices.
 
-### 8.3 安装独立的配网服务
+### 8.3 Install the standalone provisioning service
 
-下面是依据实际流程整理的简化版本，仅支持开放网络和 WPA/WPA2 个人网络。它直接创建目标 Wi-Fi 配置，再激活连接，避免把“当前扫描列表中看不到 SSID”作为拒绝连接的前置条件。隐藏 SSID 会启用主动探测；WPA 企业认证、强制 WPA3 网络不在此示例范围内。
+The simplified service below follows the tested flow and supports open networks plus WPA/WPA2 personal networks. It creates the target Wi-Fi profile and activates it directly instead of rejecting a network merely because its SSID is absent from the current scan list. Hidden SSIDs use active probing; WPA enterprise and WPA3-only networks are outside this example.
 
-它使用临时配置名完成验证，成功后替换自己上次保存的配置；不会清空其他 Wi-Fi 配置。热点开启期间没有自动刷新网络列表，直接输入 SSID 即可。
+It validates with a temporary profile, then replaces the last profile it created on success; other Wi-Fi profiles remain untouched. The hotspot does not auto-refresh the network list, so enter the SSID directly.
 
-创建 `/usr/local/libexec/box-provision.py`：
+Create `/usr/local/libexec/box-provision.py`:
 
 ```bash
 install -d -m 0755 /usr/local/libexec
@@ -822,15 +824,15 @@ def connect(ssid, password):
     finally:
         busy.release()
 
-PAGE = """<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+PAGE = """<!doctype html><html lang="en"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>盒子配网</title><style>body{max-width:32rem;margin:3rem auto;padding:1rem;
+<title>Box Wi-Fi setup</title><style>body{max-width:32rem;margin:3rem auto;padding:1rem;
 font:16px system-ui}input,button{box-sizing:border-box;width:100%;padding:.8rem;
-margin:.5rem 0}p{line-height:1.6}</style><h1>连接 Wi-Fi</h1>
-<p>提交后热点会暂时断开。成功后通过 Bark 获取地址；失败后重新连接 Box-Setup。</p>
-<form id="form"><label>Wi-Fi 名称<input id="ssid" required></label>
-<label>密码（开放网络留空）<input id="password" type="password"></label>
-<button id="submit">连接</button></form><p id="message"></p>
+margin:.5rem 0}p{line-height:1.6}</style><h1>Connect to Wi-Fi</h1>
+<p>The hotspot will disconnect after submission. On success, use Bark for the address; on failure, reconnect to Box-Setup.</p>
+<form id="form"><label>Wi-Fi name<input id="ssid" required></label>
+<label>Password (leave blank for open networks)<input id="password" type="password"></label>
+<button id="submit">Connect</button></form><p id="message"></p>
 <script>
 document.getElementById('form').onsubmit=async(event)=>{
 event.preventDefault();const button=document.getElementById('submit');
@@ -840,7 +842,7 @@ headers:{'Content-Type':'application/json'},body:JSON.stringify({
 ssid:document.getElementById('ssid').value,password:document.getElementById('password').value})});
 const result=await response.json();message.textContent=result.message;
 if(!response.ok)button.disabled=false;
-}catch(error){message.textContent='连接已中断，请等待 Bark 通知或重新连接配网热点。';}
+}catch(error){message.textContent='The connection was interrupted; wait for the Bark notification or reconnect to the setup hotspot.';}
 };</script></html>"""
 
 class Handler(BaseHTTPRequestHandler):
@@ -880,22 +882,22 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(password, str) or len(password) > 64 or "\x00" in ssid + password:
                 raise ValueError()
         except (ValueError, KeyError, TypeError):
-            self.reply(400, '{"message":"SSID 或密码格式无效"}')
+            self.reply(400, '{"message":"Invalid SSID or password format"}')
             return
         if not busy.acquire(blocking=False):
-            self.reply(409, '{"message":"已有配网任务正在执行"}')
+            self.reply(409, '{"message":"A provisioning task is already running"}')
             return
         try:
             if profile() != AP:
                 busy.release()
-                self.reply(409, '{"message":"当前不处于配网热点模式"}')
+                self.reply(409, '{"message":"The setup hotspot is not active"}')
                 return
         except (RuntimeError, OSError, subprocess.TimeoutExpired):
             busy.release()
-            self.reply(503, '{"message":"无线接口尚未就绪"}')
+            self.reply(503, '{"message":"The wireless interface is not ready"}')
             return
         threading.Thread(target=connect, args=(ssid, password), daemon=True).start()
-        self.reply(202, '{"message":"正在切换网络，请等待 Bark 通知"}')
+        self.reply(202, '{"message":"Switching networks; wait for the Bark notification"}')
 
 def monitor():
     offline_since = time.monotonic()
@@ -910,9 +912,9 @@ def monitor():
                     if current != last_notified and time.monotonic() >= retry_at:
                         name, address = current
                         hostname = os.uname().nodename
-                        body = f"{name}\nIP: {address}\nSSH: ssh root@{address}\n主机名: {hostname}.local"
+                        body = f"{name}\nIP: {address}\nSSH: ssh root@{address}\nHostname: {hostname}.local"
                         try:
-                            run("/usr/local/bin/bark-notify", "盒子已联网", body, "box", timeout=45)
+                            run("/usr/local/bin/bark-notify", "Box is online", body, "box", timeout=45)
                             last_notified = current
                             print("Network notification accepted by Bark", flush=True)
                         except (RuntimeError, OSError, subprocess.TimeoutExpired):
@@ -934,13 +936,13 @@ EOF
 chmod 0755 /usr/local/libexec/box-provision.py
 ```
 
-这里将“联网后通知”放在独立监控循环中，因此网页配网和开机自动连接都能触发。只有 Bark 确认接受后才记录本次已通知；发送失败会稍后重试，避免 DHCP 已完成但 DNS 或外网尚未就绪时漏掉通知。同一次稳定连接不重复通知，检测到断线后再连接会再次通知；短于轮询间隔的断线可能被略过。
+The “notify after connectivity” logic runs in a separate monitor loop, so both web provisioning and boot-time auto-connect can trigger it. It records a notification only after Bark accepts it; failures retry later so a completed DHCP lease is not lost while DNS or the Internet is still unavailable. A stable connection is notified once; reconnecting after a disconnect notifies again. A disconnect shorter than the polling interval may be missed.
 
-部署后应按验收清单做一次冷启动和断网测试。若无线驱动在 30 秒内还没准备好，需要根据 `journalctl` 调整等待策略；热点激活后也不会后台持续抢回普通 Wi-Fi，以免正在配网时断线。
+After deployment, perform a cold-boot and offline test from the acceptance checklist. If the wireless driver is still unavailable after 30 seconds, adjust the wait policy using `journalctl`; once active, the hotspot does not keep reclaiming the radio in the background, so provisioning is not interrupted.
 
-### 8.4 使用 Nginx 限制配网页面的访问范围
+### 8.4 Restrict provisioning access with Nginx
 
-后端只监听 `127.0.0.1:8765`，由 Nginx 提供网页。在专门用于配网、没有其他网站的盒子上，新建 `/etc/nginx/sites-available/box-provision`：
+The backend listens only on `127.0.0.1:8765`, while Nginx serves the page. On a box dedicated to provisioning with no other web site, create `/etc/nginx/sites-available/box-provision`:
 
 ```nginx
 server {
@@ -966,9 +968,9 @@ nginx -t && systemctl reload nginx
 systemctl enable nginx
 ```
 
-如果现有 Nginx 已有同名虚拟主机或相同用途的配网配置，应修改现有文件。限制来源网段是访问边界的一部分，不是用户身份认证；不要为这个配网页面配置公网端口转发。
+If Nginx already has a virtual host or provisioning configuration with the same purpose, edit that file instead. Source-subnet filtering is an access boundary, not user authentication; do not expose this page through public port forwarding.
 
-创建 `/etc/systemd/system/box-provision.service`：
+Create `/etc/systemd/system/box-provision.service`:
 
 ```ini
 [Unit]
@@ -995,15 +997,15 @@ systemctl enable --now box-provision.service
 journalctl -u box-provision.service -n 50 --no-pager
 ```
 
-用 root 运行是为了与旧系统的 NetworkManager 权限兼容。更严格的部署可以为专用账户配置最小 Polkit 权限。
+Run it as root for compatibility with NetworkManager permissions on the legacy system. A stricter deployment can grant a dedicated account only the required Polkit permissions.
 
-### 8.5 配置一个便于记忆的主机名
+### 8.5 Configure a memorable hostname
 
 ```bash
 hostnamectl set-hostname sms-box
 ```
 
-在 `/etc/avahi/avahi-daemon.conf` 已有的 `[server]` 节中设置：
+In the existing `[server]` section of `/etc/avahi/avahi-daemon.conf`, set:
 
 ```ini
 allow-interfaces=wlan0,eth0
@@ -1014,31 +1016,30 @@ use-ipv6=no
 systemctl restart avahi-daemon
 ```
 
-电脑与盒子接入同一局域网后，可以尝试 `ssh root@sms-box.local`。`.local` 依赖 mDNS，校园网隔离、跨 VLAN 或终端不支持 mDNS 时可能失败；此时使用实际 IP。
+Once the computer and box are on the same LAN, try `ssh root@sms-box.local`. `.local` depends on mDNS and may fail on isolated campus networks, across VLANs, or on clients without mDNS; use the actual IP then.
 
 
-## 9. 部署后的验收
+## 9. Validate the deployment
 
-完成配置后，至少验证这些场景：
+After configuration, verify at least these scenarios:
 
-- 已保存 Wi-Fi 时开机自动连接，收到带地址的 Bark 通知。
-- 目标 Wi-Fi 不可用时出现配网热点，浏览器可访问 `192.168.50.1`。
-- 配网密码输入错误时，热点能够恢复。
-- 模块插入并完成 USB 枚举后，宿主机出现预期的字符设备。
-- 通过 `systemctl restart ast-test-asterisk.service` 重启时，日志先出现 USB 准备成功，再出现容器和 Asterisk 启动结果。
-- 模块缺失时业务启动失败并重试，SSH 与配网服务仍然可用。
-- 容器中五个串口可见，Asterisk CLI 可响应，实际测试短信能够推送。
-- 重启设备后重新验证上述业务；单次服务重启成功不能代替冷启动测试。
+- With saved Wi-Fi, the box connects on boot and Bark reports its address.
+- When the target Wi-Fi is unavailable, the setup hotspot appears and `192.168.50.1` is reachable in a browser.
+- An incorrect provisioning password restores the hotspot.
+- After module insertion and USB enumeration, the host exposes the expected character devices.
+- Restarting with `systemctl restart ast-test-asterisk.service` logs USB readiness before container and Asterisk startup.
+- With the module missing, the service fails and retries while SSH and provisioning remain available.
+- All five serial ports are visible in the container, the Asterisk CLI responds, and a real test SMS is pushed.
+- Repeat the checks after reboot; a successful service restart is not a substitute for a cold-boot test.
 
-在目标环境中，USB 准备脚本、systemd 前置步骤、五个字符设备映射、Asterisk 20.6.0、`chan_quectel` 注册和 Bark 短信推送均已完成过端到端验证。镜像构建、密钥轮换和配网热点仍应在自己的硬件上做冷启动验收。
+In the target environment, the USB preparation script, systemd pre-start steps, five character-device mappings, Asterisk 20.6.0, `chan_quectel` registration, and Bark SMS delivery have been verified end to end. Validate image builds, key rotation, and the provisioning hotspot from a cold boot on your own hardware.
 
-## 参考资料
+## References
 
-- [Asterisk chan_quectel 项目](https://github.com/IchthysMaranatha/asterisk-chan-quectel)
-- [HiNAS 固件下载](https://www.ecoo.top/download)
-- [HiNAS 机顶盒刷机教程](https://www.ecoo.top/docs/category/%E6%9C%BA%E9%A1%B6%E7%9B%92%E5%88%B7%E6%9C%BA%E6%95%99%E7%A8%8B)
-- [Wi-Fi 安装脚本仓库](https://gitee.com/xjxjin/scripts)
-- [本文参考的 chan_quectel 仓库](https://github.com/IchthysMaranatha/asterisk-chan-quectel)
-- [chan_quectel 配置示例](https://github.com/IchthysMaranatha/asterisk-chan-quectel/blob/3d45c7f072131296a7e3c1a4faf5bb18751dbd87/etc/quectel.conf)
-- [Bark 服务端与 API 说明](https://github.com/Finb/Bark)
-
+- [Asterisk chan_quectel project](https://github.com/IchthysMaranatha/asterisk-chan-quectel)
+- [HiNAS firmware downloads](https://www.ecoo.top/download)
+- [HiNAS TV-box flashing guide](https://www.ecoo.top/docs/category/%E6%9C%BA%E9%A1%B6%E7%9B%92%E5%88%B7%E6%9C%BA%E6%95%99%E7%A8%8B)
+- [Wi-Fi installation-script repository](https://gitee.com/xjxjin/scripts)
+- [chan_quectel repository used by this guide](https://github.com/IchthysMaranatha/asterisk-chan-quectel)
+- [chan_quectel configuration example](https://github.com/IchthysMaranatha/asterisk-chan-quectel/blob/3d45c7f072131296a7e3c1a4faf5bb18751dbd87/etc/quectel.conf)
+- [Bark server and API documentation](https://github.com/Finb/Bark)
